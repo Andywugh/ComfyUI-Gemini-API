@@ -361,6 +361,16 @@ class GeminiImageGenerator:
                 if hasattr(response, 'candidates') and response.candidates:
                     self.log(f"API响应包含 {len(response.candidates)} 个候选项")
                     
+                    # 检查是否是安全过滤阻止的响应
+                    if (hasattr(response.candidates[0], 'finish_reason')):
+                        reason = response.candidates[0].finish_reason
+                        self.log(f"完成原因: {reason}")
+                        
+                        # 对于安全过滤，我们不重试，直接返回响应和提示信息
+                        if "IMAGE_SAFETY" in str(reason) or "SAFETY" in str(reason):
+                            self.log("请求被安全过滤器阻止，不再重试")
+                            return response, "图像生成被安全过滤阻止"
+                    
                     # 验证响应内容是否有效
                     if (hasattr(response.candidates[0], 'content') and 
                         response.candidates[0].content is not None and
@@ -380,16 +390,11 @@ class GeminiImageGenerator:
                 response_attrs = [attr for attr in dir(response) if not attr.startswith('_')]
                 self.log(f"响应对象属性: {', '.join(response_attrs)}")
                 
-                # 检查finish_reason
-                if (hasattr(response, 'candidates') and response.candidates and
-                    hasattr(response.candidates[0], 'finish_reason')):
-                    self.log(f"完成原因: {response.candidates[0].finish_reason}")
-                
                 # 如果已是最后一次尝试，返回最后一次的响应
                 if attempt == retry_count:
                     self.log("达到最大重试次数，返回最后一次响应")
                     return response, "多次尝试后API未返回有效内容"
-                
+            
             except Exception as api_error:
                 error_message = str(api_error)
                 self.log(f"API调用错误（尝试 #{attempt}）: {error_message}")
@@ -598,6 +603,9 @@ class GeminiImageGenerator:
                         if seed > max_int32:
                             adjusted_seed = seed % max_int32
                             error_message += f"\n\n原始种子值: {seed}\n调整后的种子值: {adjusted_seed}\n\n请使用较小的种子值或让系统自动生成。"
+                    elif "安全过滤" in error_detail or "SAFETY" in error_detail:
+                        self.log("请求被安全过滤器阻止")
+                        error_message = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
                     else:
                         error_message = f"API错误：{error_detail}\n\n可能的解决方案：\n1. 检查API密钥是否正确\n2. 检查网络连接\n3. 确认提示内容不违反内容政策\n4. 稍后再试"
                     
@@ -621,113 +629,141 @@ class GeminiImageGenerator:
                     self.cleanup_temp_files(keep_temp_files)
                     return (self.generate_empty_image(width, height), full_text)
                 
-                # 多次尝试后有响应，但有警告
-                if error and response:
+                # 特殊处理：有响应但带有安全过滤警告
+                elif error and response and ("安全过滤" in error or "SAFETY" in error):
+                    self.log("请求被安全过滤器阻止，返回友好提示")
+                    error_message = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
+                    full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + error_message
+                    self.cleanup_temp_files(keep_temp_files)
+                    return (self.generate_empty_image(width, height), full_text)
+                # 常规警告处理
+                elif error and response:
                     self.log(f"API响应成功但有警告: {error}")
                 
                 self.log("API响应接收成功，正在处理...")
                 
+                # 首先检查是否有安全过滤或其他阻止生成的原因
+                if (hasattr(response, 'candidates') and response.candidates and
+                    hasattr(response.candidates[0], 'finish_reason')):
+                    reason = response.candidates[0].finish_reason
+                    self.log(f"API完成原因: {reason}")
+                    
+                    # 如果是安全过滤，直接提供友好提示而不尝试处理图像
+                    if "IMAGE_SAFETY" in str(reason) or "SAFETY" in str(reason):
+                        self.log("请求被安全过滤器阻止")
+                        response_text = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容。"
+                        full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + response_text
+                        self.cleanup_temp_files(keep_temp_files)
+                        return (self.generate_empty_image(width, height), full_text)
+                
                 # 检查响应中是否有图像
                 image_found = False
                 
-                # 遍历响应部分
-                for part in response.candidates[0].content.parts:
-                    # 检查是否为文本部分
-                    if hasattr(part, 'text') and part.text is not None:
-                        text_content = part.text
-                        response_text += text_content
-                        self.log(f"API返回文本: {text_content[:100]}..." if len(text_content) > 100 else text_content)
+                # 确保content和parts存在再尝试遍历
+                if (hasattr(response, 'candidates') and response.candidates and
+                    hasattr(response.candidates[0], 'content') and 
+                    response.candidates[0].content is not None and
+                    hasattr(response.candidates[0].content, 'parts') and
+                    response.candidates[0].content.parts is not None):
                     
-                    # 检查是否为图像部分
-                    elif hasattr(part, 'inline_data') and part.inline_data is not None:
-                        self.log("API返回数据解析处理")
-                        try:
-                            # 获取图像数据
-                            image_data = part.inline_data.data
-                            mime_type = part.inline_data.mime_type if hasattr(part.inline_data, 'mime_type') else "未知"
-                            self.log(f"图像数据类型: {type(image_data)}, MIME类型: {mime_type}, 数据长度: {len(image_data) if image_data else 0}")
-                            
-                            # 跳过空数据
-                            if not image_data or len(image_data) < 100:
-                                self.log("警告: 图像数据为空或太小")
-                                continue
-                            
-                            # 直接保存为文件 - 跳过BytesIO
-                            timestamp = int(time.time())
-                            filename = f"gemini_image_{timestamp}.raw"
-                            img_file = os.path.join(self.images_dir, filename)
-                            
-                            with open(img_file, "wb") as f:
-                                f.write(image_data)
-                            self.log(f"已保存原始图像数据到: {img_file}")
-                            self.temp_files.append(img_file)  # 添加到临时文件列表
-                            
-                            # 创建默认空白图像
-                            pil_image = Image.new('RGB', (width, height), color=(128, 128, 128))
-                            
-                            # 尝试解析文件
-                            success = False
-                            
-                            # 尝试直接打开原始文件
+                    # 遍历响应部分
+                    for part in response.candidates[0].content.parts:
+                        # 检查是否为文本部分
+                        if hasattr(part, 'text') and part.text is not None:
+                            text_content = part.text
+                            response_text += text_content
+                            self.log(f"API返回文本: {text_content[:100]}..." if len(text_content) > 100 else text_content)
+                        
+                        # 检查是否为图像部分
+                        elif hasattr(part, 'inline_data') and part.inline_data is not None:
+                            self.log("API返回数据解析处理")
                             try:
-                                saved_image = Image.open(img_file)
-                                self.log(f"成功打开原始图像，格式: {saved_image.format}, 尺寸: {saved_image.width}x{saved_image.height}")
-                                success = True
+                                # 获取图像数据
+                                image_data = part.inline_data.data
+                                mime_type = part.inline_data.mime_type if hasattr(part.inline_data, 'mime_type') else "未知"
+                                self.log(f"图像数据类型: {type(image_data)}, MIME类型: {mime_type}, 数据长度: {len(image_data) if image_data else 0}")
                                 
-                                # 确保是RGB模式
-                                if saved_image.mode != 'RGB':
-                                    saved_image = saved_image.convert('RGB')
+                                # 跳过空数据
+                                if not image_data or len(image_data) < 100:
+                                    self.log("警告: 图像数据为空或太小")
+                                    continue
                                 
-                                # 调整尺寸
-                                if saved_image.width != width or saved_image.height != height:
-                                    saved_image = saved_image.resize((width, height), Image.Resampling.LANCZOS)
+                                # 直接保存为文件 - 跳过BytesIO
+                                timestamp = int(time.time())
+                                filename = f"gemini_image_{timestamp}.raw"
+                                img_file = os.path.join(self.images_dir, filename)
                                 
-                                pil_image = saved_image
+                                with open(img_file, "wb") as f:
+                                    f.write(image_data)
+                                self.log(f"已保存原始图像数据到: {img_file}")
+                                self.temp_files.append(img_file)  # 添加到临时文件列表
                                 
-                            except Exception as e1:
-                                self.log(f"无法直接打开原始文件: {str(e1)}")
+                                # 创建默认空白图像
+                                pil_image = Image.new('RGB', (width, height), color=(128, 128, 128))
                                 
-                                # 尝试转换为PNG后打开
-                                png_file = os.path.join(self.images_dir, f"gemini_image_{timestamp}.png")
+                                # 尝试解析文件
+                                success = False
+                                
+                                # 尝试直接打开原始文件
                                 try:
-                                    with open(png_file, "wb") as f:
-                                        f.write(image_data)
-                                    self.log(f"已保存数据为PNG: {png_file}")
-                                    self.temp_files.append(png_file)  # 添加到临时文件列表
-                                    
-                                    saved_image = Image.open(png_file)
-                                    self.log(f"成功通过PNG打开图像，尺寸: {saved_image.width}x{saved_image.height}")
+                                    saved_image = Image.open(img_file)
+                                    self.log(f"成功打开原始图像，格式: {saved_image.format}, 尺寸: {saved_image.width}x{saved_image.height}")
                                     success = True
                                     
-                                    # 确保是RGB模式并调整尺寸
+                                    # 确保是RGB模式
                                     if saved_image.mode != 'RGB':
                                         saved_image = saved_image.convert('RGB')
                                     
+                                    # 调整尺寸
                                     if saved_image.width != width or saved_image.height != height:
                                         saved_image = saved_image.resize((width, height), Image.Resampling.LANCZOS)
                                     
                                     pil_image = saved_image
                                     
-                                except Exception as e2:
-                                    self.log(f"PNG格式打开也失败: {str(e2)}")
-                                    self.log("使用默认空白图像")
-                            
-                            # 转换为ComfyUI格式
-                            img_array = np.array(pil_image).astype(np.float32) / 255.0
-                            img_tensor = torch.from_numpy(img_array).unsqueeze(0)
-                            
-                            self.log(f"图像转换为张量成功, 形状: {img_tensor.shape}")
-                            image_found = True
-                            
-                            # 清理临时文件
-                            self.cleanup_temp_files(keep_temp_files)
-                            
-                            # 合并日志和API返回文本
-                            full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + response_text
-                            return (img_tensor, full_text)
-                        except Exception as e:
-                            self.log(f"图像处理错误: {e}")
-                            traceback.print_exc()  # 添加详细的错误追踪信息
+                                except Exception as e1:
+                                    self.log(f"无法直接打开原始文件: {str(e1)}")
+                                    
+                                    # 尝试转换为PNG后打开
+                                    png_file = os.path.join(self.images_dir, f"gemini_image_{timestamp}.png")
+                                    try:
+                                        with open(png_file, "wb") as f:
+                                            f.write(image_data)
+                                        self.log(f"已保存数据为PNG: {png_file}")
+                                        self.temp_files.append(png_file)  # 添加到临时文件列表
+                                        
+                                        saved_image = Image.open(png_file)
+                                        self.log(f"成功通过PNG打开图像，尺寸: {saved_image.width}x{saved_image.height}")
+                                        success = True
+                                        
+                                        # 确保是RGB模式并调整尺寸
+                                        if saved_image.mode != 'RGB':
+                                            saved_image = saved_image.convert('RGB')
+                                        
+                                        if saved_image.width != width or saved_image.height != height:
+                                            saved_image = saved_image.resize((width, height), Image.Resampling.LANCZOS)
+                                        
+                                        pil_image = saved_image
+                                        
+                                    except Exception as e2:
+                                        self.log(f"PNG格式打开也失败: {str(e2)}")
+                                        self.log("使用默认空白图像")
+                                
+                                # 转换为ComfyUI格式
+                                img_array = np.array(pil_image).astype(np.float32) / 255.0
+                                img_tensor = torch.from_numpy(img_array).unsqueeze(0)
+                                
+                                self.log(f"图像转换为张量成功, 形状: {img_tensor.shape}")
+                                image_found = True
+                                
+                                # 清理临时文件
+                                self.cleanup_temp_files(keep_temp_files)
+                                
+                                # 合并日志和API返回文本
+                                full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + response_text
+                                return (img_tensor, full_text)
+                            except Exception as e:
+                                self.log(f"图像处理错误: {e}")
+                                traceback.print_exc()  # 添加详细的错误追踪信息
                 
                 # 检查是否找到图像数据
                 if not image_found:
