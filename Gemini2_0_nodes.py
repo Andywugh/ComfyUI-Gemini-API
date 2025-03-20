@@ -366,10 +366,15 @@ class GeminiImageGenerator:
                         reason = response.candidates[0].finish_reason
                         self.log(f"完成原因: {reason}")
                         
-                        # 对于安全过滤，我们不重试，直接返回响应和提示信息
+                        # 修改：对于安全过滤，记录但继续重试
                         if "IMAGE_SAFETY" in str(reason) or "SAFETY" in str(reason):
-                            self.log("请求被安全过滤器阻止，不再重试")
-                            return response, "图像生成被安全过滤阻止"
+                            self.log(f"请求被安全过滤器阻止（尝试 #{attempt}/{retry_count}），尝试重新生成...")
+                            # 如果是最后一次尝试，返回安全过滤的信息
+                            if attempt == retry_count:
+                                self.log("达到最大重试次数，返回安全过滤信息")
+                                return response, "多次尝试后仍被安全过滤阻止"
+                            # 否则继续下一次尝试
+                            continue
                     
                     # 验证响应内容是否有效
                     if (hasattr(response.candidates[0], 'content') and 
@@ -632,7 +637,10 @@ class GeminiImageGenerator:
                 # 特殊处理：有响应但带有安全过滤警告
                 elif error and response and ("安全过滤" in error or "SAFETY" in error):
                     self.log("请求被安全过滤器阻止，返回友好提示")
-                    error_message = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
+                    if "多次尝试后仍被安全过滤阻止" in error:
+                        error_message = f"尝试了 {max_retries} 次生成图像，但所有尝试都被安全过滤阻止。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
+                    else:
+                        error_message = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
                     full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + error_message
                     self.cleanup_temp_files(keep_temp_files)
                     return (self.generate_empty_image(width, height), full_text)
@@ -650,8 +658,8 @@ class GeminiImageGenerator:
                     
                     # 如果是安全过滤，直接提供友好提示而不尝试处理图像
                     if "IMAGE_SAFETY" in str(reason) or "SAFETY" in str(reason):
-                        self.log("请求被安全过滤器阻止")
-                        response_text = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容。"
+                        self.log("最终请求被安全过滤器阻止")
+                        response_text = f"尝试了 {max_retries} 次生成图像，但都被安全过滤阻止。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
                         full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + response_text
                         self.cleanup_temp_files(keep_temp_files)
                         return (self.generate_empty_image(width, height), full_text)
@@ -714,11 +722,11 @@ class GeminiImageGenerator:
                                     if saved_image.mode != 'RGB':
                                         saved_image = saved_image.convert('RGB')
                                     
-                                    # 调整尺寸
-                                    if saved_image.width != width or saved_image.height != height:
-                                        saved_image = saved_image.resize((width, height), Image.Resampling.LANCZOS)
-                                    
+                                    # 不再强制调整尺寸，使用API返回的原始尺寸
                                     pil_image = saved_image
+                                    # 记录实际输出尺寸与请求尺寸的差异
+                                    if saved_image.width != width or saved_image.height != height:
+                                        self.log(f"注意: API返回的图像尺寸({saved_image.width}x{saved_image.height})与请求尺寸({width}x{height})不同，保留原始尺寸")
                                     
                                 except Exception as e1:
                                     self.log(f"无法直接打开原始文件: {str(e1)}")
@@ -735,15 +743,15 @@ class GeminiImageGenerator:
                                         self.log(f"成功通过PNG打开图像，尺寸: {saved_image.width}x{saved_image.height}")
                                         success = True
                                         
-                                        # 确保是RGB模式并调整尺寸
+                                        # 确保是RGB模式但不调整尺寸
                                         if saved_image.mode != 'RGB':
                                             saved_image = saved_image.convert('RGB')
                                         
-                                        if saved_image.width != width or saved_image.height != height:
-                                            saved_image = saved_image.resize((width, height), Image.Resampling.LANCZOS)
-                                        
                                         pil_image = saved_image
-                                        
+                                        # 记录实际输出尺寸与请求尺寸的差异
+                                        if saved_image.width != width or saved_image.height != height:
+                                            self.log(f"注意: API返回的图像尺寸({saved_image.width}x{saved_image.height})与请求尺寸({width}x{height})不同，保留原始尺寸")
+                                    
                                     except Exception as e2:
                                         self.log(f"PNG格式打开也失败: {str(e2)}")
                                         self.log("使用默认空白图像")
