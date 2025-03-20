@@ -27,7 +27,7 @@ class GeminiImageGenerator:
                 "temperature": ("FLOAT", {"default": 1, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
             "optional": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 9999999999}),
                 "image": ("IMAGE",),
                 "keep_temp_files": ("BOOLEAN", {"default": False}),
                 "max_retries": ("INT", {"default": 5, "min": 1, "max": 10}),
