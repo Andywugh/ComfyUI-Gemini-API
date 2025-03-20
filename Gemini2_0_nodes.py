@@ -30,7 +30,6 @@ class GeminiImageGenerator:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 9999999999}),
                 "image": ("IMAGE",),
                 "keep_temp_files": ("BOOLEAN", {"default": False}),
-                "max_retries": ("INT", {"default": 5, "min": 1, "max": 10}),
             }
         }
 
@@ -81,10 +80,6 @@ class GeminiImageGenerator:
             self.log(f"无法检查google-genai版本: {e}")
         
         self.temp_files = []  # 添加临时文件跟踪列表
-        
-        # 重试设置
-        self.max_retries = 5  # 最大重试次数
-        self.initial_retry_delay = 2  # 初始重试延迟（秒）
     
     def log(self, message):
         """全局日志函数：记录到日志列表"""
@@ -338,95 +333,57 @@ class GeminiImageGenerator:
             self.log(f"创建诊断报告失败: {e}")
             return None
     
-    def retry_api_call(self, client, model, contents, config, prompt, max_retries=5):
+    def call_api(self, client, model, contents, config, prompt):
         """
-        使用指数退避重试API调用
+        简单的API调用函数，没有重试机制
         返回: (response, error_message)，如果成功则error_message为None
         """
-        # 使用提供的max_retries或者实例默认值
-        retry_count = max_retries if max_retries > 0 else self.max_retries
-        
-        for attempt in range(1, retry_count + 1):
-            try:
-                self.log(f"API调用尝试 #{attempt}/{retry_count}")
+        try:
+            self.log("调用Gemini API")
+            
+            # 调用API
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+            
+            # 记录API响应基本信息
+            if hasattr(response, 'candidates') and response.candidates:
+                self.log(f"API响应包含 {len(response.candidates)} 个候选项")
                 
-                # 调用API
-                response = client.models.generate_content(
-                    model=model,
-                    contents=contents,
-                    config=config
-                )
+                # 检查是否是安全过滤阻止的响应
+                if hasattr(response.candidates[0], 'finish_reason'):
+                    reason = response.candidates[0].finish_reason
+                    self.log(f"完成原因: {reason}")
+                    
+                    # 对于安全过滤，直接返回响应和提示信息
+                    if "IMAGE_SAFETY" in str(reason) or "SAFETY" in str(reason):
+                        self.log("请求被安全过滤器阻止")
+                        return response, "图像生成被安全过滤阻止"
                 
-                # 记录API响应基本信息
-                if hasattr(response, 'candidates') and response.candidates:
-                    self.log(f"API响应包含 {len(response.candidates)} 个候选项")
-                    
-                    # 检查是否是安全过滤阻止的响应
-                    if (hasattr(response.candidates[0], 'finish_reason')):
-                        reason = response.candidates[0].finish_reason
-                        self.log(f"完成原因: {reason}")
-                        
-                        # 修改：对于安全过滤，记录但继续重试
-                        if "IMAGE_SAFETY" in str(reason) or "SAFETY" in str(reason):
-                            self.log(f"请求被安全过滤器阻止（尝试 #{attempt}/{retry_count}），尝试重新生成...")
-                            # 如果是最后一次尝试，返回安全过滤的信息
-                            if attempt == retry_count:
-                                self.log("达到最大重试次数，返回安全过滤信息")
-                                return response, "多次尝试后仍被安全过滤阻止"
-                            # 否则继续下一次尝试
-                            continue
-                    
-                    # 验证响应内容是否有效
-                    if (hasattr(response.candidates[0], 'content') and 
-                        response.candidates[0].content is not None and
-                        hasattr(response.candidates[0].content, 'parts') and
-                        response.candidates[0].content.parts is not None):
-                        self.log(f"API调用成功（尝试 #{attempt}）")
-                        return response, None
-                    else:
-                        error = "API响应中content结构无效或parts为空"
-                        self.log(f"无效响应（尝试 #{attempt}）: {error}")
+                # 验证响应内容是否有效
+                if (hasattr(response.candidates[0], 'content') and 
+                    response.candidates[0].content is not None and
+                    hasattr(response.candidates[0].content, 'parts') and
+                    response.candidates[0].content.parts is not None):
+                    self.log("API调用成功")
+                    return response, None
                 else:
-                    error = "API响应中没有候选项"
-                    self.log(f"无效响应（尝试 #{attempt}）: {error}")
-                
-                # 如果响应无效但没有抛出异常，记录详细信息
-                self.log(f"响应对象类型: {type(response)}")
-                response_attrs = [attr for attr in dir(response) if not attr.startswith('_')]
-                self.log(f"响应对象属性: {', '.join(response_attrs)}")
-                
-                # 如果已是最后一次尝试，返回最后一次的响应
-                if attempt == retry_count:
-                    self.log("达到最大重试次数，返回最后一次响应")
-                    return response, "多次尝试后API未返回有效内容"
+                    error = "API响应中content结构无效或parts为空"
+                    self.log(f"无效响应: {error}")
+                    return response, error
+            else:
+                error = "API响应中没有候选项"
+                self.log(f"无效响应: {error}")
+                return response, error
             
-            except Exception as api_error:
-                error_message = str(api_error)
-                self.log(f"API调用错误（尝试 #{attempt}）: {error_message}")
-                
-                # 对于一些特定错误，不再重试
-                if "400 Bad Request" in error_message and "Invalid value" in error_message:
-                    self.log("参数错误，不再重试")
-                    return None, error_message
-                
-                if "401 Unauthorized" in error_message:
-                    self.log("认证失败，不再重试")
-                    return None, error_message
-                
-                # 如果已是最后一次尝试，返回错误
-                if attempt == retry_count:
-                    self.log("达到最大重试次数，返回错误")
-                    return None, error_message
-            
-            # 计算下一次重试的延迟（指数退避）
-            retry_delay = self.initial_retry_delay * (2 ** (attempt - 1))
-            self.log(f"等待 {retry_delay} 秒后重试...")
-            time.sleep(retry_delay)
-        
-        # 不应该到达这里，但以防万一
-        return None, "重试失败，未获取有效响应"
+        except Exception as api_error:
+            error_message = str(api_error)
+            self.log(f"API调用错误: {error_message}")
+            return None, error_message
     
-    def generate_image(self, prompt, api_key, model, width, height, temperature, seed=0, image=None, keep_temp_files=False, max_retries=5):
+    def generate_image(self, prompt, api_key, model, width, height, temperature, seed=0, image=None, keep_temp_files=False):
         """生成图像 - 使用简化的API密钥管理"""
         temp_img_path = None
         response_text = ""
@@ -566,13 +523,12 @@ class GeminiImageGenerator:
             
             try:
                 # 调用API（使用重试机制）
-                response, error = self.retry_api_call(
+                response, error = self.call_api(
                     client=client, 
                     model=model, 
                     contents=contents, 
                     config=gen_config, 
-                    prompt=prompt,
-                    max_retries=max_retries
+                    prompt=prompt
                 )
                 
                 # 如果返回了错误而不是响应
@@ -616,7 +572,7 @@ class GeminiImageGenerator:
                     
                     # 检查是否包含重试信息，添加到错误消息
                     if "多次尝试后" in error_detail:
-                        error_message += f"\n\n系统已尝试 {max_retries} 次请求，但仍未获得有效响应。您可以尝试增加重试次数或稍后再试。"
+                        error_message += "\n\n系统请求失败。请稍后再试。"
                     
                     # 创建诊断报告
                     report_path = self.create_diagnostic_report(
@@ -637,10 +593,7 @@ class GeminiImageGenerator:
                 # 特殊处理：有响应但带有安全过滤警告
                 elif error and response and ("安全过滤" in error or "SAFETY" in error):
                     self.log("请求被安全过滤器阻止，返回友好提示")
-                    if "多次尝试后仍被安全过滤阻止" in error:
-                        error_message = f"尝试了 {max_retries} 次生成图像，但所有尝试都被安全过滤阻止。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
-                    else:
-                        error_message = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
+                    error_message = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
                     full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + error_message
                     self.cleanup_temp_files(keep_temp_files)
                     return (self.generate_empty_image(width, height), full_text)
@@ -658,8 +611,8 @@ class GeminiImageGenerator:
                     
                     # 如果是安全过滤，直接提供友好提示而不尝试处理图像
                     if "IMAGE_SAFETY" in str(reason) or "SAFETY" in str(reason):
-                        self.log("最终请求被安全过滤器阻止")
-                        response_text = f"尝试了 {max_retries} 次生成图像，但都被安全过滤阻止。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
+                        self.log("请求被安全过滤器阻止")
+                        response_text = "由于安全原因，Google Gemini无法生成此图像。请修改您的提示，避免可能违反使用条款的内容，或尝试不同的参考图像。"
                         full_text = "## 处理日志\n" + "\n".join(self.log_messages) + "\n\n## API返回\n" + response_text
                         self.cleanup_temp_files(keep_temp_files)
                         return (self.generate_empty_image(width, height), full_text)
